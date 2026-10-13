@@ -1,42 +1,56 @@
-/*
- * Wordle in C - Terminal version
- * Compile: gcc -o wordle wordle.c
- * Run:     ./wordle
- */
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200809L
 
+#include <ctype.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
 #include <time.h>
-#include <ctype.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
 
 #define WORD_LEN     5
 #define MAX_GUESSES  6
-#define WORD_COUNT   50
+#define FRAME_W      41
 
-/* ANSI color codes */
-#define RESET   "\033[0m"
-#define BOLD    "\033[1m"
-#define GREEN   "\033[42m\033[30m"
-#define YELLOW  "\033[43m\033[30m"
-#define GRAY    "\033[100m\033[37m"
-#define WHITE   "\033[107m\033[30m"
+#define RESET       "\033[0m"
+#define BOLD        "\033[1m"
+#define EOL         "\033[K\n"
 
-/* ── Word list ─────────────────────────────────────────────────────────── */
-const char *WORDS[WORD_COUNT] = {
-    "CRANE", "SLATE", "AUDIO", "EARTH", "MAGIC",
-    "BLADE", "STORM", "LIGHT", "POWER", "CLOUD",
-    "FLAME", "STONE", "GRACE", "PRIZE", "TRUST",
-    "BLEND", "CRISP", "FLUTE", "GLOOM", "CHUNK",
-    "BRISK", "SCALP", "WRATH", "SPOKE", "GRILL",
-    "TROUT", "QUILT", "PLANK", "SWAMP", "KNELT",
-    "DWARF", "YACHT", "CHOIR", "PRISM", "BLAZE",
-    "GHOST", "CRAVE", "FROST", "SHINE", "BRAVE",
-    "DRIFT", "GROAN", "SPILL", "CROWN", "FEAST",
-    "CLIMB", "BRUTE", "GLINT", "WALTZ", "PIXEL"
+#define TILE_GREEN  "\033[48;5;28m\033[1;97m"
+#define TILE_YELLOW "\033[48;5;178m\033[1;30m"
+#define TILE_GRAY   "\033[48;5;239m\033[1;97m"
+#define KEY_UNUSED  "\033[48;5;252m\033[1;30m"
+#define KEY_ELIM    "\033[48;5;236m\033[38;5;242m"
+
+#define FG_GREEN    "\033[1;38;5;40m"
+#define FG_YELLOW   "\033[1;38;5;220m"
+#define FG_RED      "\033[1;38;5;203m"
+#define FG_DIM      "\033[38;5;240m"
+#define FG_MID      "\033[38;5;245m"
+#define FG_LIGHT    "\033[38;5;252m"
+#define FG_WHITE    "\033[1;97m"
+
+static const char *WORDS[] = {
+    "CRANE","SLATE","AUDIO","EARTH","MAGIC","BLADE","STORM","LIGHT","POWER","CLOUD",
+    "FLAME","STONE","GRACE","PRIZE","TRUST","BLEND","CRISP","FLUTE","GLOOM","CHUNK",
+    "BRISK","SCALP","WRATH","SPOKE","GRILL","TROUT","QUILT","PLANK","SWAMP","KNELT",
+    "DWARF","YACHT","CHOIR","PRISM","BLAZE","GHOST","CRAVE","FROST","SHINE","BRAVE",
+    "DRIFT","GROAN","SPILL","CROWN","FEAST","CLIMB","BRUTE","GLINT","WALTZ","PIXEL",
+    "APPLE","BEACH","BRICK","CHAIR","DREAM","EAGLE","FIELD","GIANT","HEART","IVORY",
+    "JELLY","KNIFE","LEMON","MANGO","NIGHT","OCEAN","PIANO","QUEEN","RIVER","SUGAR",
+    "TIGER","UNCLE","VIVID","WATER","YOUTH","ZEBRA","PLANT","SMILE","TRAIN","WORLD",
+    "HOUSE","MUSIC","DANCE","SPACE","FLOOR","BREAD","CLOCK","DRINK","FAIRY","GRAPE",
+    "HORSE","JOKER","LUCKY","MAPLE","NOBLE","OLIVE","PEARL","QUIET","ROBIN","SHEEP",
+    "THUMB","UNITY","VOICE","WHEAT","YEARN"
 };
+#define WORD_COUNT ((int)(sizeof WORDS / sizeof WORDS[0]))
 
-/* ── Data structures ───────────────────────────────────────────────────── */
+static char (*g_dict)[WORD_LEN + 1];
+static size_t g_dict_n;
+
 typedef enum { UNKNOWN, CORRECT, PRESENT, ABSENT } LetterState;
 
 typedef struct {
@@ -49,32 +63,138 @@ typedef struct {
     Guess       guesses[MAX_GUESSES];
     int         num_guesses;
     int         solved;
-    LetterState keyboard[26];   /* A-Z state */
+    LetterState keyboard[26];
 } Game;
 
-/* ── Helpers ────────────────────────────────────────────────────────────── */
-void to_upper(char *s) {
-    for (; *s; s++) *s = toupper((unsigned char)*s);
+typedef struct {
+    int played, wins, streak, best;
+    int dist[MAX_GUESSES];
+} Stats;
+
+enum { K_NONE = 0, K_ENTER = -1, K_BACK = -2, K_QUIT = -3 };
+enum { T_EMPTY, T_TYPED, T_FILLED };
+
+static struct termios g_orig, g_raw;
+static int g_active;
+static int g_pad;
+
+static void term_restore(void)
+{
+    if (!g_active) return;
+    g_active = 0;
+    static const char s[] = "\033[0m\033[?25h\033[?1049l";
+    ssize_t r = write(STDOUT_FILENO, s, sizeof s - 1);
+    (void)r;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig);
 }
 
-int is_alpha_word(const char *s) {
-    for (int i = 0; i < WORD_LEN; i++)
-        if (!isalpha((unsigned char)s[i])) return 0;
-    return s[WORD_LEN] == '\0';
+static void on_signal(int sig)
+{
+    term_restore();
+    _exit(128 + sig);
 }
 
-int word_in_list(const char *word) {
-    for (int i = 0; i < WORD_COUNT; i++)
-        if (strcmp(word, WORDS[i]) == 0) return 1;
+static int term_init(void)
+{
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return -1;
+    if (tcgetattr(STDIN_FILENO, &g_orig) < 0) return -1;
+
+    g_raw = g_orig;
+    g_raw.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+    g_raw.c_cc[VMIN]  = 1;
+    g_raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_raw) < 0) return -1;
+
+    g_active = 1;
+    atexit(term_restore);
+    signal(SIGINT,  on_signal);
+    signal(SIGTERM, on_signal);
+    signal(SIGHUP,  on_signal);
+
+    printf("\033[?1049h\033[?25l\033[2J");
+    fflush(stdout);
     return 0;
 }
 
-/* ── Evaluation ─────────────────────────────────────────────────────────── */
-void evaluate_guess(const char *guess, const char *target, LetterState *states) {
-    char pool[WORD_LEN + 1];
-    strcpy(pool, target);
+static int read_key(void)
+{
+    unsigned char c;
+    ssize_t n = read(STDIN_FILENO, &c, 1);
+    if (n <= 0) return K_QUIT;
 
-    /* First pass: correct positions */
+    if (c == 27) {
+        struct termios t = g_raw;
+        t.c_cc[VMIN] = 0;
+        t.c_cc[VTIME] = 1;
+        tcsetattr(STDIN_FILENO, TCSANOW, &t);
+        unsigned char b;
+        while (read(STDIN_FILENO, &b, 1) == 1) { }
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_raw);
+        return K_NONE;
+    }
+    if (c == '\n' || c == '\r')  return K_ENTER;
+    if (c == 127  || c == 8)     return K_BACK;
+    if (c == 4)                  return K_QUIT;
+    if (isalpha(c))              return toupper(c);
+    return K_NONE;
+}
+
+static void sleep_ms(int ms)
+{
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+static int cmp_word(const void *a, const void *b) { return strcmp(a, b); }
+
+static void load_dict(void)
+{
+    const char *paths[] = { "/usr/share/dict/words", "/usr/share/dict/american-english",
+                            "/usr/share/dict/british-english", NULL };
+    for (int p = 0; paths[p]; p++) {
+        FILE *f = fopen(paths[p], "r");
+        if (!f) continue;
+
+        size_t cap = 0;
+        char line[128];
+        while (fgets(line, sizeof line, f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (strlen(line) != WORD_LEN) continue;
+            int ok = 1;
+            for (int i = 0; i < WORD_LEN; i++)
+                if (!islower((unsigned char)line[i])) { ok = 0; break; }
+            if (!ok) continue;
+
+            if (g_dict_n == cap) {
+                cap = cap ? cap * 2 : 4096;
+                char (*tmp)[WORD_LEN + 1] = realloc(g_dict, cap * sizeof *g_dict);
+                if (!tmp) break;
+                g_dict = tmp;
+            }
+            for (int i = 0; i <= WORD_LEN; i++)
+                g_dict[g_dict_n][i] = (char)toupper((unsigned char)line[i]);
+            g_dict_n++;
+        }
+        fclose(f);
+        break;
+    }
+    if (g_dict_n < 1000) { free(g_dict); g_dict = NULL; g_dict_n = 0; }
+    else qsort(g_dict, g_dict_n, sizeof *g_dict, cmp_word);
+}
+
+static int valid_word(const char *w)
+{
+    for (int i = 0; i < WORD_COUNT; i++)
+        if (strcmp(w, WORDS[i]) == 0) return 1;
+    if (g_dict_n == 0) return 1;
+    return bsearch(w, g_dict, g_dict_n, sizeof *g_dict, cmp_word) != NULL;
+}
+
+static void evaluate_guess(const char *guess, const char *target, LetterState *states)
+{
+    char pool[WORD_LEN];
+    memcpy(pool, target, WORD_LEN);
+
     for (int i = 0; i < WORD_LEN; i++) {
         states[i] = ABSENT;
         if (guess[i] == target[i]) {
@@ -82,8 +202,6 @@ void evaluate_guess(const char *guess, const char *target, LetterState *states) 
             pool[i] = '.';
         }
     }
-
-    /* Second pass: present but wrong position */
     for (int i = 0; i < WORD_LEN; i++) {
         if (states[i] == CORRECT) continue;
         for (int j = 0; j < WORD_LEN; j++) {
@@ -96,157 +214,260 @@ void evaluate_guess(const char *guess, const char *target, LetterState *states) 
     }
 }
 
-/* ── Keyboard state update ──────────────────────────────────────────────── */
-void update_keyboard(Game *g, const Guess *guess) {
-    /* Priority: CORRECT > PRESENT > ABSENT > UNKNOWN */
-    int priority[] = {0, 3, 2, 1};   /* indexed by LetterState */
-
+static void update_keyboard(Game *g, const Guess *guess)
+{
+    static const int priority[] = { 0, 3, 2, 1 };
     for (int i = 0; i < WORD_LEN; i++) {
-        int idx = toupper((unsigned char)guess->letters[i]) - 'A';
-        LetterState cur = g->keyboard[idx];
-        LetterState new = guess->states[i];
-        if (priority[new] > priority[cur])
-            g->keyboard[idx] = new;
+        int idx = guess->letters[i] - 'A';
+        if (priority[guess->states[i]] > priority[g->keyboard[idx]])
+            g->keyboard[idx] = guess->states[i];
     }
 }
 
-/* ── Display ────────────────────────────────────────────────────────────── */
-void print_colored_cell(char letter, LetterState state) {
-    switch (state) {
-        case CORRECT: printf(GREEN " %c " RESET, letter); break;
-        case PRESENT: printf(YELLOW " %c " RESET, letter); break;
-        case ABSENT:  printf(GRAY   " %c " RESET, letter); break;
-        default:      printf(WHITE  " %c " RESET, letter); break;
+static void init_game(Game *g)
+{
+    static int used[sizeof WORDS / sizeof WORDS[0]];
+    int left = 0;
+    for (int i = 0; i < WORD_COUNT; i++) if (!used[i]) left++;
+    if (left == 0) { memset(used, 0, sizeof used); }
+
+    int idx;
+    do { idx = rand() % WORD_COUNT; } while (used[idx]);
+    used[idx] = 1;
+
+    memset(g, 0, sizeof *g);
+    strcpy(g->target, WORDS[idx]);
+}
+
+static void ind(int extra) { printf("%*s", g_pad + extra, ""); }
+
+static void tile_line(int kind, LetterState st, char ch, int line, int tall)
+{
+    if (kind == T_FILLED) {
+        const char *style = st == CORRECT ? TILE_GREEN
+                          : st == PRESENT ? TILE_YELLOW : TILE_GRAY;
+        if (line == 1) printf("%s  %c  " RESET, style, ch);
+        else           printf("%s     " RESET, style);
+        return;
+    }
+    const char *col = kind == T_TYPED ? FG_LIGHT : FG_DIM;
+    const char *ls  = kind == T_TYPED ? FG_WHITE : "";
+    if (tall) {
+        if      (line == 0) printf("%s┌───┐" RESET, col);
+        else if (line == 2) printf("%s└───┘" RESET, col);
+        else                printf("%s│%s %c %s│" RESET, col, ls, ch, col);
+    } else {
+        printf("%s[%s %c %s]" RESET, col, ls, ch, col);
     }
 }
 
-void print_board(const Game *g) {
-    printf("\n");
-    for (int r = 0; r < MAX_GUESSES; r++) {
-        printf("  ");
-        if (r < g->num_guesses) {
-            for (int c = 0; c < WORD_LEN; c++)
-                print_colored_cell(g->guesses[r].letters[c], g->guesses[r].states[c]);
-        } else {
-            for (int c = 0; c < WORD_LEN; c++)
-                printf(WHITE "   " RESET);
-        }
-        printf("\n\n");
-    }
-}
-
-void print_keyboard(const Game *g) {
-    const char *rows[] = { "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM" };
-    printf("  Keyboard:\n");
+static void draw_keyboard(const Game *g)
+{
+    static const char *rows[] = { "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM" };
+    static const int   off[]  = { 0, 2, 6 };
     for (int r = 0; r < 3; r++) {
-        printf("  ");
+        ind(1 + off[r]);
         for (int i = 0; rows[r][i]; i++) {
-            int idx = rows[r][i] - 'A';
-            print_colored_cell(rows[r][i], g->keyboard[idx]);
+            LetterState s = g->keyboard[rows[r][i] - 'A'];
+            const char *style = s == CORRECT ? TILE_GREEN
+                              : s == PRESENT ? TILE_YELLOW
+                              : s == ABSENT  ? KEY_ELIM : KEY_UNUSED;
+            printf("%s %c " RESET " ", style, rows[r][i]);
         }
-        printf("\n");
+        printf(EOL);
     }
-    printf("\n");
 }
 
-void clear_screen(void) {
-    printf("\033[H\033[2J");
-}
+static void draw_stats(const Game *g, const Stats *st, int rows)
+{
+    ind(1);
+    printf(BOLD "Played %d   Won %d%%   Streak %d   Best %d" RESET EOL,
+           st->played, st->played ? st->wins * 100 / st->played : 0,
+           st->streak, st->best);
 
-void print_header(void) {
-    printf(BOLD "\n  ╔══════════════╗\n");
-    printf(      "  ║  W O R D L E  ║\n");
-    printf(      "  ╚══════════════╝\n" RESET);
-    printf("  Guess the 5-letter word in 6 tries.\n");
-    printf("  " GREEN " C " RESET " Correct   "
-               YELLOW " P " RESET " Present   "
-               GRAY   " A " RESET " Absent\n\n");
-}
+    if (rows < 28) return;
 
-/* ── Game logic ─────────────────────────────────────────────────────────── */
-void init_game(Game *g) {
-    srand((unsigned)time(NULL));
-    strncpy(g->target, WORDS[rand() % WORD_COUNT], WORD_LEN + 1);
-    g->num_guesses = 0;
-    g->solved = 0;
-    memset(g->guesses, 0, sizeof(g->guesses));
-    memset(g->keyboard, 0, sizeof(g->keyboard));
-}
+    static const char FULL[] = "████████████████████";
+    int max = 1;
+    for (int i = 0; i < MAX_GUESSES; i++) if (st->dist[i] > max) max = st->dist[i];
 
-int process_guess(Game *g, const char *input) {
-    if (!is_alpha_word(input)) {
-        printf("  ✗ Please enter a 5-letter word.\n\n");
-        return 0;
+    for (int i = 0; i < MAX_GUESSES; i++) {
+        int n = st->dist[i] * 20 / max;
+        if (st->dist[i] > 0 && n == 0) n = 1;
+        int hl = g->solved && i == g->num_guesses - 1;
+        ind(1);
+        printf(FG_MID "%d " RESET "%s%.*s" RESET " %d" EOL,
+               i + 1, hl ? FG_GREEN : FG_MID, n * 3, FULL, st->dist[i]);
     }
-    /* Uncomment the next block to enforce dictionary check: */
-    /*
-    if (!word_in_list(input)) {
-        printf("  ✗ Not in word list.\n\n");
-        return 0;
-    }
-    */
-
-    Guess *guess = &g->guesses[g->num_guesses];
-    memcpy(guess->letters, input, WORD_LEN);
-    evaluate_guess(input, g->target, guess->states);
-    update_keyboard(g, guess);
-    g->num_guesses++;
-
-    if (memcmp(guess->states,
-               (LetterState[]){CORRECT,CORRECT,CORRECT,CORRECT,CORRECT},
-               WORD_LEN * sizeof(LetterState)) == 0) {
-        g->solved = 1;
-    }
-    return 1;
 }
 
-void play(void) {
+static void draw(const Game *g, const char *input, int len,
+                 const Guess *pend, int reveal,
+                 const char *msg, const char *footer, const Stats *stats)
+{
+    struct winsize ws;
+    int cols = 80, rows = 24;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+        cols = ws.ws_col;
+        rows = ws.ws_row;
+    }
+    g_pad = cols > FRAME_W ? (cols - FRAME_W) / 2 : 0;
+    int tall = rows >= 36;
+
+    printf("\033[H");
+
+    ind(11); printf(FG_LIGHT "╔═════════════════╗" RESET EOL);
+    ind(11); printf(FG_LIGHT "║   " FG_GREEN "W " FG_YELLOW "O " FG_GREEN "R "
+                    FG_MID "D " FG_YELLOW "L " FG_GREEN "E" FG_LIGHT "   ║" RESET EOL);
+    ind(11); printf(FG_LIGHT "╚═════════════════╝" RESET EOL);
+
+    ind(2);
+    printf(TILE_GREEN "  " RESET FG_LIGHT " correct   " RESET
+           TILE_YELLOW "  " RESET FG_LIGHT " misplaced  " RESET
+           TILE_GRAY "  " RESET FG_LIGHT " absent" RESET EOL);
+    printf(EOL);
+
+    for (int r = 0; r < MAX_GUESSES; r++) {
+        for (int line = tall ? 0 : 1; line <= (tall ? 2 : 1); line++) {
+            ind(6);
+            for (int c = 0; c < WORD_LEN; c++) {
+                int kind = T_EMPTY;
+                LetterState st = UNKNOWN;
+                char ch = ' ';
+
+                if (r < g->num_guesses) {
+                    kind = T_FILLED;
+                    st = g->guesses[r].states[c];
+                    ch = g->guesses[r].letters[c];
+                } else if (r == g->num_guesses) {
+                    if (pend) {
+                        ch = pend->letters[c];
+                        if (c < reveal) { kind = T_FILLED; st = pend->states[c]; }
+                        else            { kind = T_TYPED; }
+                    } else if (c < len) {
+                        kind = T_TYPED;
+                        ch = input[c];
+                    }
+                }
+                tile_line(kind, st, ch, line, tall);
+                if (c < WORD_LEN - 1) printf(" ");
+            }
+            printf(EOL);
+        }
+        if (r < MAX_GUESSES - 1) printf(EOL);
+    }
+
+    ind(6);
+    printf("%s" EOL, msg);
+    printf(EOL);
+
+    if (stats) draw_stats(g, stats, rows);
+    else       draw_keyboard(g);
+
+    printf(EOL);
+    ind(1);
+    printf(FG_DIM "%s" RESET EOL, footer);
+
+    printf("\033[J");
+    fflush(stdout);
+}
+
+#define FOOT_PLAY "Enter submit · Backspace delete · Ctrl-C quit"
+#define FOOT_END  "Enter: play again · Q: quit"
+
+static int play(Stats *st)
+{
+    static const char *praise[] = {
+        "Genius!", "Magnificent!", "Impressive!", "Splendid!", "Great!", "Phew!"
+    };
+
     Game g;
     init_game(&g);
 
-    char buf[64];
+    char input[WORD_LEN + 1] = "";
+    int  len = 0;
+    char msg[128] = "";
+
+    printf("\033[2J");
 
     while (!g.solved && g.num_guesses < MAX_GUESSES) {
-        clear_screen();
-        print_header();
-        print_board(&g);
-        print_keyboard(&g);
+        draw(&g, input, len, NULL, 0, msg, FOOT_PLAY, NULL);
+        msg[0] = '\0';
 
-        printf("  Guess %d/%d: ", g.num_guesses + 1, MAX_GUESSES);
-        if (!fgets(buf, sizeof(buf), stdin)) break;
+        int k = read_key();
+        if (k == K_QUIT) return 0;
 
-        /* Strip newline */
-        buf[strcspn(buf, "\r\n")] = '\0';
-        to_upper(buf);
+        if (k >= 'A' && k <= 'Z') {
+            if (len < WORD_LEN) { input[len++] = (char)k; input[len] = '\0'; }
+        } else if (k == K_BACK) {
+            if (len > 0) input[--len] = '\0';
+        } else if (k == K_ENTER) {
+            if (len < WORD_LEN) {
+                snprintf(msg, sizeof msg, FG_RED "Not enough letters" RESET);
+            } else if (!valid_word(input)) {
+                snprintf(msg, sizeof msg, FG_RED "Not in word list" RESET);
+            } else {
+                Guess pend;
+                memcpy(pend.letters, input, WORD_LEN);
+                evaluate_guess(input, g.target, pend.states);
 
-        process_guess(&g, buf);
+                for (int r = 1; r <= WORD_LEN; r++) {
+                    draw(&g, input, len, &pend, r, "", FOOT_PLAY, NULL);
+                    sleep_ms(280);
+                }
+                tcflush(STDIN_FILENO, TCIFLUSH);
+
+                g.guesses[g.num_guesses] = pend;
+                update_keyboard(&g, &pend);
+                g.num_guesses++;
+
+                g.solved = 1;
+                for (int i = 0; i < WORD_LEN; i++)
+                    if (pend.states[i] != CORRECT) g.solved = 0;
+
+                len = 0;
+                input[0] = '\0';
+            }
+        }
     }
 
-    /* Final screen */
-    clear_screen();
-    print_header();
-    print_board(&g);
-
+    st->played++;
     if (g.solved) {
-        const char *msgs[] = {
-            "Genius!", "Magnificent!", "Impressive!",
-            "Splendid!", "Great!", "Phew!"
-        };
-        printf("  🎉 %s  (%d/%d)\n\n", msgs[g.num_guesses - 1], g.num_guesses, MAX_GUESSES);
+        st->wins++;
+        st->streak++;
+        if (st->streak > st->best) st->best = st->streak;
+        st->dist[g.num_guesses - 1]++;
+        snprintf(msg, sizeof msg, FG_GREEN "%s" RESET " (%d/%d)",
+                 praise[g.num_guesses - 1], g.num_guesses, MAX_GUESSES);
     } else {
-        printf("  The word was: " BOLD "%s" RESET "\n\n", g.target);
+        st->streak = 0;
+        snprintf(msg, sizeof msg, "The word was " BOLD "%s" RESET, g.target);
+    }
+
+    draw(&g, "", 0, NULL, 0, msg, FOOT_END, st);
+
+    for (;;) {
+        int k = read_key();
+        if (k == K_ENTER) return 1;
+        if (k == K_QUIT || k == 'Q') return 0;
     }
 }
 
-/* ── Main ───────────────────────────────────────────────────────────────── */
-int main(void) {
-    char again[8];
-    do {
-        play();
-        printf("  Play again? (y/n): ");
-        if (!fgets(again, sizeof(again), stdin)) break;
-    } while (tolower((unsigned char)again[0]) == 'y');
+int main(void)
+{
+    if (term_init() < 0) {
+        fprintf(stderr, "wordle: needs an interactive terminal.\n");
+        return 1;
+    }
+    setvbuf(stdout, NULL, _IOFBF, 1 << 16);
+    srand((unsigned)time(NULL) ^ (unsigned)getpid());
+    load_dict();
 
-    printf("  Thanks for playing!\n\n");
+    Stats stats = {0};
+    while (play(&stats)) { }
+
+    term_restore();
+    printf("Thanks for playing!\n");
+    free(g_dict);
     return 0;
 }
